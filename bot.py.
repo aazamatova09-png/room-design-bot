@@ -1,0 +1,178 @@
+
+import asyncio
+import os
+import base64
+import logging
+
+import httpx
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.types import Message
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+
+# Настройки
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+MODEL = "gemini-flash-latest"
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+
+# Этапы общения с пользователем
+class RoomForm(StatesGroup):
+    waiting_photo = State()
+    waiting_budget = State()
+    waiting_style = State()
+
+
+@dp.message(CommandStart())
+async def start(message: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(RoomForm.waiting_photo)
+
+    await message.answer(
+        "Привет! Я UyimDesignBot 🏠\n\n"
+        "Я помогу подобрать дизайн комнаты под твой бюджет.\n\n"
+        "Для начала отправь фотографию своей комнаты 📸"
+    )
+
+
+# Получаем фотографию
+@dp.message(RoomForm.waiting_photo, F.photo)
+async def get_photo(message: Message, state: FSMContext):
+    photo = message.photo[-1]
+
+    file = await bot.get_file(photo.file_id)
+    image_data = await bot.download_file(file.file_path)
+
+    encoded_image = base64.b64encode(
+        image_data.read()
+    ).decode("utf-8")
+
+    await state.update_data(photo=encoded_image)
+
+    await state.set_state(RoomForm.waiting_budget)
+
+    await message.answer(
+        "Фото получила! 🏠\n\n"
+        "Теперь напиши свой бюджет в тенге.\n"
+        "Например: 300000"
+    )
+
+
+# Получаем бюджет
+@dp.message(RoomForm.waiting_budget)
+async def get_budget(message: Message, state: FSMContext):
+    await state.update_data(budget=message.text)
+
+    await state.set_state(RoomForm.waiting_style)
+
+    await message.answer(
+        "Какой стиль интерьера хочешь?\n\n"
+        "Например:\n"
+        "• Скандинавский\n"
+        "• Минимализм\n"
+        "• Современный\n"
+        "• Лофт"
+    )
+
+
+# Получаем стиль и отправляем всё в Gemini
+@dp.message(RoomForm.waiting_style)
+async def get_style(message: Message, state: FSMContext):
+    data = await state.get_data()
+
+    await message.answer("Анализирую комнату, подожди немного... 🔎")
+
+    prompt = f"""
+Ты помощник по дизайну интерьера.
+
+Проанализируй фотографию комнаты.
+
+Бюджет пользователя: {data['budget']} тенге.
+Желаемый стиль: {message.text}.
+
+Ответь на русском языке:
+1. Опиши, что видишь на фотографии.
+2. Предложи оформление комнаты в выбранном стиле.
+3. Посоветуй подходящие цвета стен и пола.
+4. Предложи мебель и освещение.
+5. Дай примерное распределение бюджета.
+6. Не превышай указанный бюджет.
+
+Не придумывай точные цены товаров из магазинов.
+Если размеры комнаты неизвестны, не выдумывай их.
+"""
+
+    try:
+        url = (
+            "https://generativelanguage.googleapis.com/"
+            f"v1beta/models/{MODEL}:generateContent"
+        )
+
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": data["photo"]
+                        }
+                    }
+                ]
+            }]
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-goog-api-key": GEMINI_API_KEY
+        }
+
+        async with httpx.AsyncClient(timeout=90) as client:
+            response = await client.post(
+                url,
+                headers=headers,
+                json=payload
+            )
+            response.raise_for_status()
+
+        result = response.json()
+        answer = result["candidates"][0]["content"]["parts"][0]["text"]
+
+        await message.answer(answer)
+
+    except Exception:
+        logging.exception("Ошибка Gemini")
+        await message.answer(
+            "Не получилось проанализировать фото 😔\n"
+            "Попробуй ещё раз немного позже."
+        )
+
+    await state.clear()
+
+    await message.answer(
+        "Хочешь сделать новый дизайн? Отправь /start"
+    )
+
+
+# Если пользователь отправил не фотографию
+@dp.message(RoomForm.waiting_photo)
+async def photo_error(message: Message):
+    await message.answer("Пожалуйста, отправь именно фотографию комнаты 📸")
+
+
+async def main():
+    if not BOT_TOKEN or not GEMINI_API_KEY:
+        raise RuntimeError("Не заданы BOT_TOKEN и GEMINI_API_KEY")
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(main())
